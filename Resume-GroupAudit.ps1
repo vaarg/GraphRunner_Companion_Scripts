@@ -202,6 +202,25 @@ function Test-GraphGroupMemberAccess {
         [Int]$RefreshInterval = 300
     )
 
+    # Auto-detect ClientID from the appid claim in the access token JWT unless
+    # the caller explicitly passed -ClientID. The refresh token is bound to the
+    # client_id it was originally issued for, so refreshing with a different one
+    # returns 400. Mirrors the JWT decoding already done in Invoke-RefreshGraphTokens.
+    if (-not $PSBoundParameters.ContainsKey('ClientID')) {
+        try {
+            $payload = $Tokens.access_token.Split(".")[1]
+            $payload = $payload.Replace('-', '+').Replace('_', '/')
+            while ($payload.Length % 4) { $payload += "=" }
+            $claims = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if ($claims.appid) {
+                $ClientID = $claims.appid
+                Write-Host -ForegroundColor Yellow "[*] Auto-detected ClientID from token: $ClientID"
+            }
+        } catch {
+            Write-Host -ForegroundColor Yellow "[*] Could not auto-detect ClientID from token, using default ($ClientID)."
+        }
+    }
+
     # Resolve group list from whichever input was provided
 
     $groupList = @()
