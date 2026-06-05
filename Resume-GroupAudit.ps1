@@ -403,3 +403,220 @@ function Test-GraphGroupMemberAccess {
 
     return $results
 }
+
+
+function Get-MemberAccessGroupDetails {
+    <#
+    .SYNOPSIS
+        Enriches the updatable group list from Test-GraphGroupMemberAccess with
+        details fetched from Graph: description, mail, group type (Security vs M365),
+        sync status (Cloud-only vs Synced from AD), and role-assignability.
+
+    .DESCRIPTION
+        Designed for the _ids.txt fallback file written by Test-GraphGroupMemberAccess
+        (DisplayName:GUID format, one per line). Use this to turn the raw list of
+        groups you have member-update access to into a full-detail audit CSV.
+
+        Not intended for all_groups.csv or other full-directory enumerations.
+
+    .PARAMETER InputFile
+        Path to a _ids.txt file produced by Test-GraphGroupMemberAccess.
+        Each line must be in "DisplayName:GUID" format.
+
+    .PARAMETER OutputFile
+        CSV file to write one-row-per-group details to (description, type, sync
+        status, role-assignability, member count).
+
+    .PARAMETER MembersOutputFile
+        CSV file to write one-row-per-member membership to. Columns include
+        groupId and groupDisplayName so rows join back to OutputFile.
+        Defaults to updatable_group_members.csv.
+
+    .EXAMPLE
+        Get-MemberAccessGroupDetails -Tokens $tokens -InputFile .\updatable_groups_resumed_ids.txt -OutputFile .\updatable_details.csv -MembersOutputFile .\updatable_members.csv
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [object]$Tokens,
+
+        [Parameter(Mandatory = $true)]
+        [string]$InputFile,
+
+        [Parameter(Mandatory = $false)]
+        [string]$OutputFile = "updatable_group_details.csv",
+
+        [Parameter(Mandatory = $false)]
+        [string]$MembersOutputFile = "updatable_group_members.csv",
+
+        [Parameter(Mandatory = $false)]
+        [string]$tenantid = $global:tenantid,
+        [ValidateSet("Yammer","Outlook","MSTeams","Graph","AzureCoreManagement","AzureManagement","MSGraph","DODMSGraph","Custom","Substrate")]
+        [String[]]$Client = "MSGraph",
+        [String]$ClientID = "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+        [String]$Resource = "https://graph.microsoft.com",
+        [ValidateSet('Mac','Windows','AndroidMobile','iPhone')]
+        [String]$Device = "Windows",
+        [ValidateSet('Android','IE','Chrome','Firefox','Edge','Safari')]
+        [String]$Browser = "Edge"
+    )
+
+    # Auto-detect ClientID from token appid claim, same as Test-GraphGroupMemberAccess
+    if (-not $PSBoundParameters.ContainsKey('ClientID')) {
+        try {
+            $payload = $Tokens.access_token.Split(".")[1]
+            $payload = $payload.Replace('-', '+').Replace('_', '/')
+            while ($payload.Length % 4) { $payload += "=" }
+            $claims = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if ($claims.appid) {
+                $ClientID = $claims.appid
+                Write-Host -ForegroundColor Yellow "[*] Auto-detected ClientID from token: $ClientID"
+            }
+        } catch {}
+    }
+
+    if (-not (Test-Path $InputFile)) {
+        Write-Host -ForegroundColor Red "[!] InputFile not found: $InputFile"
+        return
+    }
+
+    $guidPattern = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    $groups = @(Get-Content $InputFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -match "^(.+):($guidPattern)$") {
+            [PSCustomObject]@{ displayName = $Matches[1]; id = $Matches[2] }
+        }
+    } | Where-Object { $_ })
+
+    if ($groups.Count -eq 0) {
+        Write-Host -ForegroundColor Red "[!] No valid DisplayName:GUID entries found in $InputFile"
+        return
+    }
+
+    Write-Host -ForegroundColor Yellow "[*] Fetching details for $($groups.Count) groups..."
+
+    $accesstoken  = $Tokens.access_token
+    $refreshToken = $Tokens.refresh_token
+    $headers = @{
+        "Authorization" = "Bearer $accesstoken"
+        "Content-Type"  = "application/json"
+    }
+
+    $select = "id,displayName,description,mail,groupTypes,securityEnabled,mailEnabled,onPremisesSyncEnabled,isAssignableToRole,createdDateTime,visibility"
+
+    $results       = @()
+    $memberResults = @()
+
+    foreach ($group in $groups) {
+        $uri = "https://graph.microsoft.com/v1.0/groups/$($group.id)?`$select=$select"
+        $attempt = 0
+        $done    = $false
+
+        while (-not $done -and $attempt -lt 2) {
+            try {
+                $detail = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+                $done = $true
+
+                $groupType = if ($detail.groupTypes -contains "Unified") {
+                    "Microsoft 365"
+                } elseif ($detail.securityEnabled -and $detail.mailEnabled) {
+                    "Mail-Enabled Security"
+                } elseif ($detail.securityEnabled) {
+                    "Security"
+                } elseif ($detail.mailEnabled) {
+                    "Distribution"
+                } else {
+                    "Unknown"
+                }
+
+                $syncStatus = if ($detail.onPremisesSyncEnabled -eq $true) { "Synced (AD)" } else { "Cloud-only" }
+
+                # Fetch members with pagination
+                $members   = @()
+                $memberUri = "https://graph.microsoft.com/v1.0/groups/$($detail.id)/members?`$select=id,displayName,userPrincipalName,mail"
+                do {
+                    try {
+                        $memberResp = Invoke-RestMethod -Uri $memberUri -Headers $headers -Method Get
+                        foreach ($m in $memberResp.value) {
+                            $mType = if ($m.'@odata.type') {
+                                $raw = $m.'@odata.type' -replace '#microsoft\.graph\.', ''
+                                $raw.Substring(0,1).ToUpper() + $raw.Substring(1)
+                            } else { "Unknown" }
+                            $members += [PSCustomObject]@{
+                                groupId           = $detail.id
+                                groupDisplayName  = $detail.displayName
+                                memberId          = $m.id
+                                memberDisplayName = $m.displayName
+                                memberUPN         = $m.userPrincipalName
+                                memberMail        = $m.mail
+                                memberType        = $mType
+                            }
+                        }
+                        $memberUri = $memberResp.'@odata.nextLink'
+                    } catch {
+                        $msc = $null
+                        try { $msc = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+                        Write-Host -ForegroundColor Red "[!] HTTP $msc fetching members of '$($detail.displayName)': $($_.Exception.Message)"
+                        $memberUri = $null
+                    }
+                } while ($memberUri)
+
+                $memberResults += $members
+
+                $results += [PSCustomObject]@{
+                    id                 = $detail.id
+                    displayName        = $detail.displayName
+                    description        = $detail.description
+                    mail               = $detail.mail
+                    groupType          = $groupType
+                    syncStatus         = $syncStatus
+                    isAssignableToRole = $detail.isAssignableToRole
+                    visibility         = $detail.visibility
+                    createdDateTime    = $detail.createdDateTime
+                    memberCount        = $members.Count
+                }
+
+                Write-Host -ForegroundColor Green "[+] $($detail.displayName) - $groupType, $syncStatus$(if ($detail.isAssignableToRole) { ', Role-Assignable' }) ($($members.Count) members)"
+
+            } catch {
+                $statusCode = $null
+                try { $statusCode = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+
+                if ($statusCode -eq 401 -and $attempt -eq 0) {
+                    Write-Host -ForegroundColor Yellow "[*] 401 - refreshing token..."
+                    Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
+                        -tenantid $tenantid -Resource $Resource -Client $Client `
+                        -ClientID $ClientID -Browser $Browser -Device $Device
+                    if ($global:tokens) {
+                        $accesstoken  = $global:tokens.access_token
+                        $refreshToken = $global:tokens.refresh_token
+                        $headers["Authorization"] = "Bearer $accesstoken"
+                    }
+                    $attempt++
+                } elseif ($statusCode -eq 429) {
+                    $retryAfter = 10
+                    try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                    Write-Host -ForegroundColor Red "[*] 429 on '$($group.displayName)' - sleeping ${retryAfter}s..."
+                    Start-Sleep -Seconds $retryAfter
+                    $attempt++
+                } else {
+                    Write-Host -ForegroundColor Red "[!] HTTP $statusCode on '$($group.displayName)' ($($group.id)): $($_.Exception.Message)"
+                    $done = $true
+                }
+            }
+        }
+    }
+
+    Write-Host -ForegroundColor Green "[*] Done. Retrieved details for $($results.Count)/$($groups.Count) groups."
+
+    if ($results.Count -gt 0 -and $OutputFile) {
+        $results | Export-Csv -Path $OutputFile -NoTypeInformation
+        Write-Host -ForegroundColor Green "[*] Group details saved to $OutputFile"
+    }
+
+    if ($memberResults.Count -gt 0 -and $MembersOutputFile) {
+        $memberResults | Export-Csv -Path $MembersOutputFile -NoTypeInformation
+        Write-Host -ForegroundColor Green "[*] Member list saved to $MembersOutputFile ($($memberResults.Count) rows)"
+    }
+
+    return $results
+}
