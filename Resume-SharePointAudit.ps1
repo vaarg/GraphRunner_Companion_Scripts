@@ -1026,15 +1026,15 @@ function Invoke-DriveSearchSharePointByList {
     # Strip KQL trailing wildcards -- the drive search endpoint returns 400 on wildcard terms
     $cleanedQuery = $cleanedQuery -replace '(\w)\*', '$1'
     # Remove parenthesised groups that contain only operators/whitespace after stripping
-    $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*(?:(?:AND|OR)\s*)+\)', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)\(\s*(?:(?:AND|OR)\s*)+\)', '')
     # Remove orphaned operators immediately after ( or immediately before )
-    $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*(?:AND|OR)\s+', '(')
-    $cleanedQuery = [regex]::Replace($cleanedQuery, '\s+(?:AND|OR)\s*\)', ')')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)\(\s*(?:AND|OR)\s+', '(')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)\s+(?:AND|OR)\s*\)', ')')
     # Collapse consecutive operators left by the above passes
-    $cleanedQuery = [regex]::Replace($cleanedQuery, '\b(AND|OR)\b(?:\s+\b(?:AND|OR)\b)+', '$1')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)\b(AND|OR)\b(?:\s+\b(?:AND|OR)\b)+', '$1')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*\)', '')
-    $cleanedQuery = [regex]::Replace($cleanedQuery, '^\s*\b(AND|OR)\b\s*', '')
-    $cleanedQuery = [regex]::Replace($cleanedQuery, '\s*\b(AND|OR)\b\s*$', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)^\s*\b(AND|OR)\b\s*', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)\s*\b(AND|OR)\b\s*$', '')
     $cleanedQuery = $cleanedQuery.Trim() -replace '\s{2,}', ' '
 
     # If nothing remains after stripping, derive a keyword from the extracted identifiers
