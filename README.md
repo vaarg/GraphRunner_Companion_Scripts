@@ -10,7 +10,7 @@ Three-phase replacement for `Get-UpdatableGroups`. Splits group enumeration, acc
 > Full documentation: [wiki/GroupAudit](https://github.com/vaarg/GraphSpeeder/wiki/GroupAudit)
 
 ### [Resume-SharePointAudit.ps1](Resume-SharePointAudit.ps1)
-Three-phase SharePoint and OneDrive audit. Enumerates site collections via the SPO SDK (admin), tests per-site Graph API access as a standard user, then searches accessible sites directly via `contentSources` — bypassing the site-discovery step that fails in restricted tenants.
+Multi-phase SharePoint and OneDrive audit. Enumerates site collections via the SPO SDK (admin), tests per-site Graph API access as a standard user, then searches accessible sites using KQL `path:` scoping — bypassing the site-discovery step that fails in restricted tenants. Includes a per-drive fallback search for environments where the Graph Search API is blocked.
 
 > Full documentation: [wiki/SharePointAudit](https://github.com/vaarg/GraphSpeeder/wiki/SharePointAudit)
 
