@@ -1023,6 +1023,8 @@ function Invoke-DriveSearchSharePointByList {
     $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:"[^"]+"', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:\S+', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '\bNEAR\(n=\d+\)\s*', ' ')
+    # Strip KQL trailing wildcards -- the drive search endpoint returns 400 on wildcard terms
+    $cleanedQuery = $cleanedQuery -replace '(\w)\*', '$1'
     # Remove parenthesised groups that contain only operators/whitespace after stripping
     $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*(?:(?:AND|OR)\s*)+\)', '')
     # Remove orphaned operators immediately after ( or immediately before )
