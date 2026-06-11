@@ -385,10 +385,14 @@ function Invoke-SearchSharePointByList {
         enumeration step that fails in restricted environments.
 
     .DESCRIPTION
-        Loads accessible sites from the input CSV, batches their Graph site IDs into
-        groups (the Graph Search API accepts up to 20 contentSources per request),
-        and issues a search request for each batch. Results are aggregated and
-        deduplicated across batches.
+        Loads accessible sites from the input CSV, batches their web URLs into groups,
+        and issues one Graph Search API request per batch with a KQL path: filter that
+        restricts results to those sites. Results are aggregated and deduplicated across
+        batches.
+
+        Note: the Graph Search API's contentSources property only applies to external
+        Microsoft Search Connectors, not native SharePoint/OneDrive content. Scoping
+        is done via KQL path: in the queryString instead.
 
         Output format (CSV columns and interactive download behavior) is identical to
         GraphRunner's Invoke-SearchSharePointAndOneDrive so the function is a drop-in
@@ -396,8 +400,7 @@ function Invoke-SearchSharePointByList {
 
     .PARAMETER InputCsv
         Path to AccessibleSharePointSites.csv produced by Test-SharePointSiteAccess.
-        Must contain a SiteId column with Graph-format compound site IDs
-        (e.g. contoso.sharepoint.com,guid1,guid2).
+        Must contain a WebUrl column with the canonical site URL returned by Graph.
 
     .PARAMETER SearchTerm
         KQL query string. Accepts Graph Search API KQL syntax including filetype,
@@ -487,11 +490,11 @@ function Invoke-SearchSharePointByList {
     }
 
     $accessibleSites = @(Import-Csv -Path $InputCsv -ErrorAction Stop | Where-Object {
-        $_.Accessible -eq "True" -and -not [string]::IsNullOrWhiteSpace($_.SiteId)
+        $_.Accessible -eq "True" -and -not [string]::IsNullOrWhiteSpace($_.WebUrl)
     })
 
     if ($accessibleSites.Count -eq 0) {
-        Write-Host -ForegroundColor Red "[!] No accessible sites with a SiteId found in $InputCsv"
+        Write-Host -ForegroundColor Red "[!] No accessible sites with a WebUrl found in $InputCsv"
         return
     }
 
@@ -514,7 +517,7 @@ function Invoke-SearchSharePointByList {
     $refreshSpan     = [TimeSpan]::FromSeconds($RefreshInterval)
     $maxRetries      = 3
 
-    # Graph Search API accepts up to 20 contentSources per request; use 15 for safety
+    # Batch size for KQL path: scoping — kept at 15 to avoid very long query strings
     $batchSize = 15
 
     # Collect hits across all batches; keyed by DriveItemID to deduplicate
@@ -522,14 +525,13 @@ function Invoke-SearchSharePointByList {
     $resultArray = [System.Collections.Generic.List[object]]::new()
     $hitNumber   = 0
 
-    $siteIds = @($accessibleSites | ForEach-Object { $_.SiteId })
-    $totalBatches = [Math]::Ceiling($siteIds.Count / $batchSize)
+    $siteWebUrls  = @($accessibleSites | ForEach-Object { $_.WebUrl })
+    $totalBatches = [Math]::Ceiling($siteWebUrls.Count / $batchSize)
 
-    for ($batchStart = 0; $batchStart -lt $siteIds.Count; $batchStart += $batchSize) {
-        $batchEnd      = [Math]::Min($batchStart + $batchSize, $siteIds.Count) - 1
-        $batchIds      = @($siteIds[$batchStart..$batchEnd])
-        $contentSources = @($batchIds | ForEach-Object { "/sites/$_" })
-        $batchNum      = [int]($batchStart / $batchSize) + 1
+    for ($batchStart = 0; $batchStart -lt $siteWebUrls.Count; $batchStart += $batchSize) {
+        $batchEnd     = [Math]::Min($batchStart + $batchSize, $siteWebUrls.Count) - 1
+        $batchWebUrls = @($siteWebUrls[$batchStart..$batchEnd])
+        $batchNum     = [int]($batchStart / $batchSize) + 1
 
         # Proactive token refresh
         if ((Get-Date) - $startTime -ge $refreshSpan) {
@@ -551,13 +553,15 @@ function Invoke-SearchSharePointByList {
         $continuePages = $true
 
         while ($continuePages) {
+            $pathFilter  = ($batchWebUrls | ForEach-Object { "path:`"$_`"" }) -join " OR "
+            $scopedQuery = "($SearchTerm) AND ($pathFilter)"
+
             $searchQuery = @{
                 requests = @(@{
-                    entityTypes    = @("driveItem")
-                    query          = @{ queryString = $SearchTerm }
-                    contentSources = $contentSources
-                    from           = $from
-                    size           = $ResultCount
+                    entityTypes = @("driveItem")
+                    query       = @{ queryString = $scopedQuery }
+                    from        = $from
+                    size        = $ResultCount
                 })
             }
 
