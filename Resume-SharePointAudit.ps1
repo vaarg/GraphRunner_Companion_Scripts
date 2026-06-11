@@ -536,9 +536,8 @@ function Invoke-SearchSharePointByList {
 
         # Proactive token refresh
         if ((Get-Date) - $startTime -ge $refreshSpan) {
-            if (!$GraphRun) {
-                Write-Host -ForegroundColor Yellow "[*] Proactive token refresh (batch $batchNum/$totalBatches)..."
-            }
+            if (!$GraphRun) { Write-Host "" }
+            Write-Host -ForegroundColor Yellow "[*] Proactive token refresh (batch $batchNum/$totalBatches)..."
             Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
                 -tenantid $tenantid -Resource $Resource -Client $Client `
                 -ClientID $ClientID -Browser $Browser -Device $Device
@@ -600,7 +599,7 @@ function Invoke-SearchSharePointByList {
                     } else {
                         if ($statusCode -eq 403) { $got403 = $true }
                         if (!$GraphRun) {
-                            Write-Host -ForegroundColor Red "[!] Search failed for batch $batchNum/$totalBatches (HTTP $statusCode): $($_.Exception.Message)"
+                            Write-Host -ForegroundColor Red "`n[!] Search failed for batch $batchNum/$totalBatches (HTTP $statusCode): $($_.Exception.Message)"
                         }
                         $done = $true
                     }
@@ -679,7 +678,7 @@ function Invoke-SearchSharePointByList {
 
             if ($OutFile -and $batchResultsList.Count -gt 0) {
                 if (!$GraphRun) {
-                    Write-Host -ForegroundColor Yellow "[*] Writing $($batchResultsList.Count) result(s) to $OutFile"
+                    Write-Host -ForegroundColor Yellow "`n[*] Writing $($batchResultsList.Count) result(s) from batch $batchNum/$totalBatches to $OutFile"
                 }
                 $batchResultsList | Export-Csv -Path $OutFile -NoTypeInformation -Append
             }
@@ -687,7 +686,15 @@ function Invoke-SearchSharePointByList {
             $from += $ResultCount
             $continuePages = $PageResults -and [bool]$hitsContainer.moreResultsAvailable
         }
+
+        if (!$GraphRun) {
+            $pct = [int](($batchNum / $totalBatches) * 100)
+            Write-Host -NoNewline -ForegroundColor Cyan "`r[*] Batch $batchNum/$totalBatches ($pct%) -- $hitNumber hit(s) so far..."
+            [System.Console]::Out.Flush()
+        }
     }
+
+    if (!$GraphRun) { Write-Host "" }
 
     $totalHits = $hitNumber
 
@@ -1218,11 +1225,19 @@ function Invoke-DriveSearchSharePointByList {
 
         if ($OutFile -and $batchResultsList.Count -gt 0) {
             if (!$GraphRun) {
-                Write-Host -ForegroundColor Yellow "[*] Writing $($batchResultsList.Count) result(s) to $OutFile"
+                Write-Host -ForegroundColor Yellow "`n[*] Writing $($batchResultsList.Count) result(s) from '$($drive.DriveName)' ($($drive.SiteWebUrl)) to $OutFile"
             }
             $batchResultsList | Export-Csv -Path $OutFile -NoTypeInformation -Append
         }
+
+        if (!$GraphRun) {
+            $pct = [int](($driveNum / $drives.Count) * 100)
+            Write-Host -NoNewline -ForegroundColor Cyan "`r[*] Drive $driveNum/$($drives.Count) ($pct%) -- $($drive.DriveName) -- $hitNumber hit(s) so far..."
+            [System.Console]::Out.Flush()
+        }
     }
+
+    if (!$GraphRun) { Write-Host "" }
 
     $totalHits = $hitNumber
 
