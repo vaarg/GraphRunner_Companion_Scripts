@@ -1040,12 +1040,11 @@ function Invoke-DriveSearchSharePointByList {
     # If nothing remains after stripping, derive a keyword from the extracted identifiers
     if ([string]::IsNullOrWhiteSpace($cleanedQuery)) {
         if ($filenamePatterns.Count -gt 0) {
-            $cleanedQuery = ($filenamePatterns | Select-Object -First 5) -join ' '
+            $cleanedQuery = ($filenamePatterns) -join ' '
         } elseif ($extensions.Count -gt 0) {
             $cleanedQuery = ($extensions |
                 ForEach-Object { $_ -replace '^\.', '' } |
-                Where-Object { $_ } |
-                Select-Object -First 5) -join ' '
+                Where-Object { $_ }) -join ' '
         }
     }
 
