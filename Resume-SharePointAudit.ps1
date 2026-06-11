@@ -527,6 +527,7 @@ function Invoke-SearchSharePointByList {
 
     $siteWebUrls  = @($accessibleSites | ForEach-Object { $_.WebUrl })
     $totalBatches = [Math]::Ceiling($siteWebUrls.Count / $batchSize)
+    $got403       = $false
 
     for ($batchStart = 0; $batchStart -lt $siteWebUrls.Count; $batchStart += $batchSize) {
         $batchEnd     = [Math]::Min($batchStart + $batchSize, $siteWebUrls.Count) - 1
@@ -597,6 +598,7 @@ function Invoke-SearchSharePointByList {
                         Start-Sleep -Seconds $retryAfter
                         # 429 does not count against the retry budget
                     } else {
+                        if ($statusCode -eq 403) { $got403 = $true }
                         if (!$GraphRun) {
                             Write-Host -ForegroundColor Red "[!] Search failed for batch $batchNum/$totalBatches (HTTP $statusCode): $($_.Exception.Message)"
                         }
@@ -684,6 +686,541 @@ function Invoke-SearchSharePointByList {
 
             $from += $ResultCount
             $continuePages = $PageResults -and [bool]$hitsContainer.moreResultsAvailable
+        }
+    }
+
+    $totalHits = $hitNumber
+
+    if ($got403) {
+        Write-Host ""
+        Write-Host -ForegroundColor Yellow "[!] One or more batches returned HTTP 403 -- the Search API may be restricted in this tenant."
+        Write-Host -ForegroundColor Yellow "[*] Try the drive-level fallback instead:"
+        Write-Host -ForegroundColor Cyan "      1. Get-SharePointDrives -Tokens `$tokens -InputCsv '$InputCsv'"
+        Write-Host -ForegroundColor Cyan "      2. Invoke-DriveSearchSharePointByList -Tokens `$tokens -InputCsv '.\AccessibleSharePointDrives.csv' -SearchTerm '$SearchTerm'"
+    }
+
+    if (!$GraphRun) {
+        Write-Host -ForegroundColor Yellow "[*] Found $totalHits unique match(es) for: $SearchTerm"
+    } elseif ($totalHits -gt 0) {
+        Write-Host -ForegroundColor Yellow "[*] Found $totalHits match(es) for detector: $DetectorName"
+    }
+
+    if (!$ReportOnly -and $totalHits -gt 0) {
+        $promptMessage = "[*] Do you want to download any of these files? (Yes/No/All)"
+        $downloading   = $true
+
+        while ($downloading) {
+            Write-Host -ForegroundColor Cyan $promptMessage
+            $answer = (Read-Host).ToLower()
+
+            if ($answer -eq "yes" -or $answer -eq "y") {
+                Write-Host -ForegroundColor Cyan '[*] Enter the result number(s) to download. Ex. "0,10,24"'
+                $resultToDownload = Read-Host
+                foreach ($res in ($resultToDownload -split ",")) {
+                    $idx = $res.Trim()
+                    if ($idx -match '^\d+$') {
+                        $fileInfo = $resultArray | Where-Object { $_.result -eq [int]$idx }
+                        if ($fileInfo) {
+                            Invoke-DriveFileDownload -Tokens $Tokens `
+                                -DriveItemIDs $fileInfo.driveitemids `
+                                -FileName     $fileInfo.filename `
+                                -Device       $Device `
+                                -Browser      $Browser
+                        }
+                    }
+                }
+                $promptMessage = "[*] Do you want to download any more files? (Yes/No/All)"
+            } elseif ($answer -eq "no" -or $answer -eq "n") {
+                Write-Output "[*] Quitting..."
+                $downloading = $false
+            } elseif ($answer -eq "all") {
+                Write-Host -ForegroundColor Cyan "[***] WARNING - Downloading ALL $totalHits match(es)."
+                foreach ($fileInfo in $resultArray) {
+                    Invoke-DriveFileDownload -Tokens $Tokens `
+                        -DriveItemIDs $fileInfo.driveitemids `
+                        -FileName     $fileInfo.filename `
+                        -Device       $Device `
+                        -Browser      $Browser
+                }
+                $downloading = $false
+            } else {
+                Write-Output "Invalid input. Please enter Yes, No, or All."
+            }
+        }
+    }
+}
+
+
+function Get-SharePointDrives {
+    <#
+    .SYNOPSIS
+        Fallback pre-step. Enumerates document library drives for each accessible site
+        and exports AccessibleSharePointDrives.csv for use with
+        Invoke-DriveSearchSharePointByList. Run this once; the drives CSV is then reused
+        across all fallback searches without re-enumerating.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Tokens,
+
+        [string]$InputCsv   = "AccessibleSharePointSites.csv",
+        [string]$OutputFile = "AccessibleSharePointDrives.csv",
+
+        [string]$tenantid = $global:tenantid,
+        [ValidateSet("Yammer","Outlook","MSTeams","Graph","AzureCoreManagement","AzureManagement","MSGraph","DODMSGraph","Custom","Substrate")]
+        [string[]]$Client = "MSGraph",
+        [string]$ClientID = "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+        [string]$Resource = "https://graph.microsoft.com",
+        [ValidateSet('Mac','Windows','AndroidMobile','iPhone')]
+        [string]$Device = "Windows",
+        [ValidateSet('Android','IE','Chrome','Firefox','Edge','Safari')]
+        [string]$Browser = "Edge",
+        [int]$RefreshInterval = 300
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('ClientID')) {
+        try {
+            $payload = $Tokens.access_token.Split(".")[1]
+            $payload = $payload.Replace('-', '+').Replace('_', '/')
+            while ($payload.Length % 4) { $payload += "=" }
+            $claims = [System.Text.Encoding]::UTF8.GetString(
+                [System.Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if ($claims.appid) {
+                $ClientID = $claims.appid
+                Write-Host -ForegroundColor Yellow "[*] Auto-detected ClientID from token: $ClientID"
+            }
+        } catch {
+            Write-Host -ForegroundColor Yellow "[*] Could not auto-detect ClientID, using default ($ClientID)."
+        }
+    }
+
+    if (-not (Test-Path $InputCsv)) {
+        Write-Host -ForegroundColor Red "[!] Input CSV not found: $InputCsv"
+        return
+    }
+
+    $accessibleSites = @(Import-Csv -Path $InputCsv -ErrorAction Stop | Where-Object {
+        $_.Accessible -eq "True" -and -not [string]::IsNullOrWhiteSpace($_.SiteId)
+    })
+
+    if ($accessibleSites.Count -eq 0) {
+        Write-Host -ForegroundColor Red "[!] No accessible sites found in $InputCsv"
+        return
+    }
+
+    Write-Host -ForegroundColor Yellow "[*] Enumerating drives for $($accessibleSites.Count) site(s)..."
+
+    $accessToken  = $Tokens.access_token
+    $refreshToken = $Tokens.refresh_token
+    $headers = @{
+        Authorization = "Bearer $accessToken"
+        Accept        = "application/json"
+    }
+
+    $startTime   = Get-Date
+    $refreshSpan = [TimeSpan]::FromSeconds($RefreshInterval)
+    $maxRetries  = 3
+    $drives      = [System.Collections.Generic.List[object]]::new()
+    $checked     = 0
+    $total       = $accessibleSites.Count
+
+    foreach ($site in $accessibleSites) {
+        $checked++
+
+        if ((Get-Date) - $startTime -ge $refreshSpan) {
+            Write-Host ""
+            Write-Host -ForegroundColor Yellow "[*] Proactive token refresh ($checked/$total)..."
+            Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
+                -tenantid $tenantid -Resource $Resource -Client $Client `
+                -ClientID $ClientID -Browser $Browser -Device $Device
+            if ($global:tokens) {
+                $accessToken  = $global:tokens.access_token
+                $refreshToken = $global:tokens.refresh_token
+                $headers["Authorization"] = "Bearer $accessToken"
+                $startTime = Get-Date
+            }
+        }
+
+        $attempt = 0
+        $done    = $false
+
+        while (-not $done -and $attempt -lt $maxRetries) {
+            try {
+                $response = Invoke-RestMethod `
+                    -Method Get `
+                    -Uri "https://graph.microsoft.com/v1.0/sites/$($site.SiteId)/drives" `
+                    -Headers $headers `
+                    -ErrorAction Stop
+
+                foreach ($drive in $response.value) {
+                    $drives.Add([pscustomobject]@{
+                        SiteId      = $site.SiteId
+                        SiteWebUrl  = $site.WebUrl
+                        DriveId     = $drive.id
+                        DriveName   = $drive.name
+                        DriveType   = $drive.driveType
+                        DriveWebUrl = $drive.webUrl
+                    })
+                }
+                $done = $true
+
+            } catch {
+                $statusCode = $null
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+
+                if ($statusCode -eq 401) {
+                    Write-Host ""
+                    Write-Host -ForegroundColor Yellow "[!] 401 on '$($site.WebUrl)' -- refreshing token (attempt $($attempt + 1)/$maxRetries)..."
+                    Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
+                        -tenantid $tenantid -Resource $Resource -Client $Client `
+                        -ClientID $ClientID -Browser $Browser -Device $Device
+                    if ($global:tokens) {
+                        $accessToken  = $global:tokens.access_token
+                        $refreshToken = $global:tokens.refresh_token
+                        $headers["Authorization"] = "Bearer $accessToken"
+                        $startTime = Get-Date
+                    }
+                    $attempt++
+                } elseif ($statusCode -eq 429) {
+                    $retryAfter = 10
+                    try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                    Write-Host ""
+                    Write-Host -ForegroundColor Red "[*] Rate limited (429) -- sleeping ${retryAfter}s..."
+                    Start-Sleep -Seconds $retryAfter
+                } else {
+                    Write-Host ""
+                    Write-Host -ForegroundColor Red "[!] HTTP $statusCode enumerating drives for '$($site.WebUrl)': $($_.Exception.Message)"
+                    $done = $true
+                }
+            }
+        }
+
+        $pct = [int](($checked / $total) * 100)
+        Write-Host -NoNewline -ForegroundColor Cyan "`r[*] $checked/$total ($pct%) -- $($drives.Count) drive(s) found so far..."
+        [System.Console]::Out.Flush()
+    }
+
+    Write-Host ""
+
+    if ($drives.Count -eq 0) {
+        Write-Host -ForegroundColor Red "[!] No drives enumerated."
+        return
+    }
+
+    $drives | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+    Write-Host -ForegroundColor Green "[*] Exported $($drives.Count) drive(s) across $total site(s) to $OutputFile"
+}
+
+
+function Invoke-DriveSearchSharePointByList {
+    <#
+    .SYNOPSIS
+        Fallback search. Uses the per-drive search endpoint instead of the Search API,
+        for tenants where POST /search/query returns HTTP 403.
+
+    .DESCRIPTION
+        Reads drive IDs from AccessibleSharePointDrives.csv (produced by
+        Get-SharePointDrives) and issues GET /drives/{id}/root/search(q='...') for each
+        drive. Because this endpoint does not support KQL managed properties, the
+        SearchTerm is parsed before sending: filetype: and filename: tokens are stripped
+        and re-applied as a client-side post-filter on the returned item names; NEAR()
+        operators are removed; the remaining keywords are passed as q=.
+
+        Output CSV format is identical to Invoke-SearchSharePointByList (same column
+        names). The Preview column is always empty as the drive search endpoint does not
+        return content snippets.
+
+    .PARAMETER InputCsv
+        Path to AccessibleSharePointDrives.csv produced by Get-SharePointDrives.
+
+    .PARAMETER SearchTerm
+        KQL query string as used with Invoke-SearchSharePointByList. filetype: and
+        filename: filters are extracted and applied client-side. NEAR() operators are
+        stripped. Other KQL operators are passed through as plain keywords.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Tokens,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SearchTerm,
+
+        [string]$InputCsv     = "AccessibleSharePointDrives.csv",
+        [int]$ResultCount     = 25,
+        [string]$DetectorName = "Custom",
+        [string]$OutFile      = "",
+        [switch]$ReportOnly,
+        [switch]$PageResults,
+        [switch]$GraphRun,
+
+        [ValidateSet('Mac','Windows','AndroidMobile','iPhone')]
+        [string]$Device  = "Windows",
+        [ValidateSet('Android','IE','Chrome','Firefox','Edge','Safari')]
+        [string]$Browser = "Edge",
+
+        [string]$tenantid = $global:tenantid,
+        [ValidateSet("Yammer","Outlook","MSTeams","Graph","AzureCoreManagement","AzureManagement","MSGraph","DODMSGraph","Custom","Substrate")]
+        [string[]]$Client = "MSGraph",
+        [string]$ClientID = "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+        [string]$Resource = "https://graph.microsoft.com",
+        [int]$RefreshInterval = 300
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('ClientID')) {
+        try {
+            $payload = $Tokens.access_token.Split(".")[1]
+            $payload = $payload.Replace('-', '+').Replace('_', '/')
+            while ($payload.Length % 4) { $payload += "=" }
+            $claims = [System.Text.Encoding]::UTF8.GetString(
+                [System.Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if ($claims.appid) { $ClientID = $claims.appid }
+        } catch {}
+    }
+
+    if (-not (Test-Path $InputCsv)) {
+        Write-Host -ForegroundColor Red "[!] Input CSV not found: $InputCsv"
+        Write-Host -ForegroundColor Red "[!] Run Get-SharePointDrives first to generate the drives list."
+        return
+    }
+
+    $drives = @(Import-Csv -Path $InputCsv -ErrorAction Stop | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.DriveId)
+    })
+
+    if ($drives.Count -eq 0) {
+        Write-Host -ForegroundColor Red "[!] No drives found in $InputCsv"
+        return
+    }
+
+    # Parse SearchTerm: extract file filters and build a clean q= keyword for the drive API.
+    # filetype: and filename: tokens are stripped and re-applied as client-side post-filters.
+    # NEAR() operators are removed. Remaining text is passed as q=.
+
+    $extensions = @(
+        [regex]::Matches($SearchTerm, '(?i)filetype:([.\w-]+)') |
+            ForEach-Object { $_.Groups[1].Value }
+    )
+
+    $filenamePatterns = @(
+        [regex]::Matches($SearchTerm, '(?i)filename:"([^"]+)"|(?i)filename:(\S+)') |
+            ForEach-Object {
+                if ($_.Groups[1].Success -and $_.Groups[1].Value) { $_.Groups[1].Value }
+                else { $_.Groups[2].Value }
+            } |
+            Where-Object { $_ }
+    )
+
+    $cleanedQuery = $SearchTerm
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filetype:[.\w-]+', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:"[^"]+"', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:\S+', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '\bNEAR\(n=\d+\)\s*', ' ')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*\)', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '^\s*\b(AND|OR)\b\s*', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '\s*\b(AND|OR)\b\s*$', '')
+    $cleanedQuery = $cleanedQuery.Trim() -replace '\s{2,}', ' '
+
+    # If nothing remains after stripping, derive a keyword from the extracted identifiers
+    if ([string]::IsNullOrWhiteSpace($cleanedQuery)) {
+        if ($filenamePatterns.Count -gt 0) {
+            $cleanedQuery = ($filenamePatterns | Select-Object -First 5) -join ' '
+        } elseif ($extensions.Count -gt 0) {
+            $cleanedQuery = ($extensions |
+                ForEach-Object { $_ -replace '^\.', '' } |
+                Where-Object { $_ } |
+                Select-Object -First 5) -join ' '
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($cleanedQuery)) {
+        Write-Host -ForegroundColor Red "[!] Could not derive a usable search term from: $SearchTerm"
+        return
+    }
+
+    if (!$GraphRun) {
+        Write-Host -ForegroundColor Yellow "[*] Searching $($drives.Count) drive(s) for: $SearchTerm"
+        Write-Host -ForegroundColor Yellow "[*] Drive API query: $cleanedQuery"
+        if ($extensions.Count -gt 0) {
+            Write-Host -ForegroundColor Yellow "[*] Client-side extension filter: $($extensions -join ', ')"
+        }
+        if ($filenamePatterns.Count -gt 0) {
+            Write-Host -ForegroundColor Yellow "[*] Client-side filename filter: $($filenamePatterns -join ', ')"
+        }
+    }
+
+    $userAgent = Invoke-ForgeUserAgent -Device $Device -Browser $Browser
+
+    $accessToken  = $Tokens.access_token
+    $refreshToken = $Tokens.refresh_token
+    $headers = @{
+        "Authorization" = "Bearer $accessToken"
+        "User-Agent"    = $userAgent
+    }
+
+    $startTime   = Get-Date
+    $refreshSpan = [TimeSpan]::FromSeconds($RefreshInterval)
+    $maxRetries  = 3
+    $selectFields = "id,name,size,webUrl,parentReference,fileSystemInfo,file,lastModifiedDateTime"
+
+    $hitMap      = [System.Collections.Generic.Dictionary[string,bool]]::new()
+    $resultArray = [System.Collections.Generic.List[object]]::new()
+    $hitNumber   = 0
+    $driveNum    = 0
+
+    foreach ($drive in $drives) {
+        $driveNum++
+
+        if ((Get-Date) - $startTime -ge $refreshSpan) {
+            if (!$GraphRun) {
+                Write-Host -ForegroundColor Yellow "`n[*] Proactive token refresh (drive $driveNum/$($drives.Count))..."
+            }
+            Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
+                -tenantid $tenantid -Resource $Resource -Client $Client `
+                -ClientID $ClientID -Browser $Browser -Device $Device
+            if ($global:tokens) {
+                $accessToken  = $global:tokens.access_token
+                $refreshToken = $global:tokens.refresh_token
+                $headers["Authorization"] = "Bearer $accessToken"
+                $startTime = Get-Date
+            }
+        }
+
+        $safeQuery     = $cleanedQuery -replace "'", "''"
+        $currentUri    = "https://graph.microsoft.com/v1.0/drives/$($drive.DriveId)/root/search(q='$safeQuery')?`$top=$ResultCount&`$select=$selectFields"
+        $continuePages = $true
+        $batchResultsList = [System.Collections.Generic.List[object]]::new()
+
+        while ($continuePages) {
+            $attempt  = 0
+            $done     = $false
+            $response = $null
+
+            while (-not $done -and $attempt -lt $maxRetries) {
+                try {
+                    $response = Invoke-RestMethod -Uri $currentUri -Headers $headers `
+                        -Method Get -ErrorAction Stop
+                    $done = $true
+                } catch {
+                    $statusCode = $null
+                    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+
+                    if ($statusCode -eq 401) {
+                        Invoke-RefreshGraphTokens -RefreshToken $refreshToken -AutoRefresh `
+                            -tenantid $tenantid -Resource $Resource -Client $Client `
+                            -ClientID $ClientID -Browser $Browser -Device $Device
+                        if ($global:tokens) {
+                            $accessToken  = $global:tokens.access_token
+                            $refreshToken = $global:tokens.refresh_token
+                            $headers["Authorization"] = "Bearer $accessToken"
+                            $startTime = Get-Date
+                        }
+                        $attempt++
+                    } elseif ($statusCode -eq 429) {
+                        $retryAfter = 10
+                        try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                        Start-Sleep -Seconds $retryAfter
+                    } else {
+                        if (!$GraphRun) {
+                            Write-Host -ForegroundColor Red "`n[!] Search failed for drive '$($drive.DriveName)' in '$($drive.SiteWebUrl)' (HTTP $statusCode): $($_.Exception.Message)"
+                        }
+                        $done = $true
+                    }
+                }
+            }
+
+            if ($null -eq $response -or $null -eq $response.value) {
+                $continuePages = $false
+                break
+            }
+
+            foreach ($item in $response.value) {
+                # Client-side post-filter: check extension and filename patterns
+                $matchesFilter = $false
+
+                if ($extensions.Count -eq 0 -and $filenamePatterns.Count -eq 0) {
+                    $matchesFilter = $true
+                } else {
+                    foreach ($fn in $filenamePatterns) {
+                        if ($item.name -like $fn) { $matchesFilter = $true; break }
+                    }
+                    if (-not $matchesFilter -and $extensions.Count -gt 0) {
+                        $itemExt = [System.IO.Path]::GetExtension($item.name).TrimStart('.')
+                        foreach ($ext in $extensions) {
+                            if ($ext -match '^\..') {
+                                # Extension starts with a dot (e.g. .git-credentials) — match full filename
+                                if ($item.name -ieq $ext) { $matchesFilter = $true; break }
+                            } elseif ($itemExt -ieq $ext) {
+                                $matchesFilter = $true; break
+                            }
+                        }
+                    }
+                }
+
+                if (-not $matchesFilter) { continue }
+
+                $driveId     = $item.parentReference.driveId
+                $itemId      = $item.id
+                $driveItemId = "${driveId}:${itemId}"
+
+                if ($hitMap.ContainsKey($driveItemId)) { continue }
+                $hitMap[$driveItemId] = $true
+
+                $sizeInBytes   = [long]$item.size
+                $sizeFormatted = if ($sizeInBytes -lt 1024) {
+                    "{0:N0} Bytes" -f $sizeInBytes
+                } elseif ($sizeInBytes -lt 1048576) {
+                    "{0:N2} KB"    -f ($sizeInBytes / 1024)
+                } elseif ($sizeInBytes -lt 1073741824) {
+                    "{0:N2} MB"    -f ($sizeInBytes / 1048576)
+                } else {
+                    "{0:N2} GB"    -f ($sizeInBytes / 1073741824)
+                }
+
+                $createdDate      = $item.fileSystemInfo.createdDateTime
+                $lastModifiedDate = $item.lastModifiedDateTime
+
+                $resultInfo = [pscustomobject]@{
+                    result       = $hitNumber
+                    filename     = $item.name
+                    driveitemids = $driveItemId
+                }
+                $logInfo = [pscustomobject]@{
+                    "Detector Name"      = $DetectorName
+                    "File Name"          = $item.name
+                    "Size"               = $sizeFormatted
+                    "Location"           = $item.webUrl
+                    "DriveItemID"        = $driveItemId
+                    "Preview"            = $null
+                    "Last Modified Date" = $lastModifiedDate
+                }
+
+                $resultArray.Add($resultInfo)
+                $batchResultsList.Add($logInfo)
+
+                if (!$ReportOnly) {
+                    Write-Host "Result [$hitNumber]"
+                    Write-Host "File Name: $($item.name)"
+                    Write-Host "Location: $($item.webUrl)"
+                    Write-Host "Created Date: $createdDate"
+                    Write-Host "Last Modified Date: $lastModifiedDate"
+                    Write-Host "Size: $sizeFormatted"
+                    Write-Host "DriveID & Item ID: $driveId\:$itemId"
+                    Write-Host ("=" * 80)
+                }
+
+                $hitNumber++
+            }
+
+            $continuePages = $PageResults -and -not [string]::IsNullOrWhiteSpace($response.'@odata.nextLink')
+            if ($continuePages) { $currentUri = $response.'@odata.nextLink' }
+        }
+
+        if ($OutFile -and $batchResultsList.Count -gt 0) {
+            if (!$GraphRun) {
+                Write-Host -ForegroundColor Yellow "[*] Writing $($batchResultsList.Count) result(s) to $OutFile"
+            }
+            $batchResultsList | Export-Csv -Path $OutFile -NoTypeInformation -Append
         }
     }
 
