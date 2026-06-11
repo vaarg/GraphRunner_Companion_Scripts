@@ -1023,6 +1023,13 @@ function Invoke-DriveSearchSharePointByList {
     $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:"[^"]+"', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:\S+', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '\bNEAR\(n=\d+\)\s*', ' ')
+    # Remove parenthesised groups that contain only operators/whitespace after stripping
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*(?:(?:AND|OR)\s*)+\)', '')
+    # Remove orphaned operators immediately after ( or immediately before )
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*(?:AND|OR)\s+', '(')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '\s+(?:AND|OR)\s*\)', ')')
+    # Collapse consecutive operators left by the above passes
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '\b(AND|OR)\b(?:\s+\b(?:AND|OR)\b)+', '$1')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '\(\s*\)', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '^\s*\b(AND|OR)\b\s*', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '\s*\b(AND|OR)\b\s*$', '')
