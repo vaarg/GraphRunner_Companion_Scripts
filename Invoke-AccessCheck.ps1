@@ -517,6 +517,12 @@ function Invoke-AccessCheck {
 
             if ($licenses -gt 0) {
                 Write-Host -ForegroundColor Green "  licenses       : $licenses assigned"
+                try {
+                    $licResp = Invoke-GRequest -Uri "https://graph.microsoft.com/v1.0/$meOrUser/licenseDetails" -TS $TS
+                    foreach ($lic in @($licResp.value)) {
+                        Write-Host -ForegroundColor Green "    - $($lic.skuPartNumber)"
+                    }
+                } catch { }
             } else {
                 Write-Host -ForegroundColor Yellow "  licenses       : None"
                 Add-Finding $findings "Info" "Identity" "No licenses assigned" "User may not have access to M365 services"
@@ -621,7 +627,11 @@ function Invoke-AccessCheck {
             if ($raResp.value.Count -gt 0) {
                 Write-Host -ForegroundColor Green "  Active directory role assignments ($($raResp.value.Count)):"
                 foreach ($ra in $raResp.value) {
-                    $rn    = if ($ra.roleDefinition) { $ra.roleDefinition.displayName } else { $ra.roleDefinitionId }
+                    $rn    = if ($ra.roleDefinition) {
+                                "$($ra.roleDefinition.displayName) ($($ra.roleDefinitionId))"
+                             } elseif ($script:RoleNames.ContainsKey($ra.roleDefinitionId)) {
+                                "$($script:RoleNames[$ra.roleDefinitionId]) ($($ra.roleDefinitionId))"
+                             } else { $ra.roleDefinitionId }
                     $scope = if ($ra.directoryScopeId -eq "/") { "Tenant-wide" } else { $ra.directoryScopeId }
                     Write-Host -ForegroundColor Green "    [+] $rn  --  scope: $scope"
                     $userRoleIds += $ra.roleDefinitionId
@@ -642,7 +652,11 @@ function Invoke-AccessCheck {
             if ($pimResp.value.Count -gt 0) {
                 Write-Host -ForegroundColor Yellow "  PIM eligible roles (NOT currently active) ($($pimResp.value.Count)):"
                 foreach ($pr in $pimResp.value) {
-                    $rn  = if ($pr.roleDefinition) { $pr.roleDefinition.displayName } else { $pr.roleDefinitionId }
+                    $rn  = if ($pr.roleDefinition) {
+                               "$($pr.roleDefinition.displayName) ($($pr.roleDefinitionId))"
+                           } elseif ($script:RoleNames.ContainsKey($pr.roleDefinitionId)) {
+                               "$($script:RoleNames[$pr.roleDefinitionId]) ($($pr.roleDefinitionId))"
+                           } else { $pr.roleDefinitionId }
                     $exp = if ($pr.scheduleInfo.expiration.endDateTime) { "expires $($pr.scheduleInfo.expiration.endDateTime)" } else { "no expiry" }
                     Write-Host -ForegroundColor Yellow "    [~] $rn  ($exp)"
                     Add-Finding $findings "High" "Roles" "PIM eligible role: $rn (not currently active)" "If activated, grants $rn; $exp"
@@ -1039,7 +1053,10 @@ function Invoke-AccessCheck {
         if ($hasMfaEnforcement -and $mfaEnumerationSucceeded -and $registeredMethods.Count -eq 0) {
             Add-Finding $findings "Critical" "CAP" "MFA is required by CAP but user has no registered MFA methods" "Authentication will likely fail or fall back unexpectedly"
         } elseif ($hasMfaEnforcement -and -not $mfaEnumerationSucceeded) {
-            Add-Finding $findings "Info" "CAP" "MFA is required by CAP but authentication methods could not be enumerated (403 Forbidden)" "Manually verify MFA registration for this user; UserAuthenticationMethod.Read.All is required"
+            Add-Finding $findings "Info" "CAP" "MFA is required by CAP but authentication methods could not be enumerated (403 Forbidden)" ("Manually verify MFA registration for this user; UserAuthenticationMethod.Read.All is required`n" +
+                    "Entra admin center → Users → All users → [user] → Authentication methods`n" +
+                    "Entra admin center → Protection → Authentication methods → Settings → System-preferred multifactor authentication`n" +
+                    "Entra admin center → Users → All users → Per-user MFA (legacy per-user state)")
         }
 
         # Check for legacy auth coverage
@@ -1310,7 +1327,11 @@ function Invoke-AccessCheck {
                 if ($spDroles.Count -gt 0) {
                     Write-Host -ForegroundColor Green "  Directory role assignments ($($spDroles.Count)):"
                     foreach ($dr in $spDroles) {
-                        $rn = if ($dr.roleDefinition) { $dr.roleDefinition.displayName } else { $dr.roleDefinitionId }
+                        $rn = if ($dr.roleDefinition) {
+                                 "$($dr.roleDefinition.displayName) ($($dr.roleDefinitionId))"
+                             } elseif ($script:RoleNames.ContainsKey($dr.roleDefinitionId)) {
+                                 "$($script:RoleNames[$dr.roleDefinitionId]) ($($dr.roleDefinitionId))"
+                             } else { $dr.roleDefinitionId }
                         $sc = if ($dr.directoryScopeId -eq "/") { "Tenant-wide" } else { $dr.directoryScopeId }
                         Write-Host -ForegroundColor Green "    [+] $rn  scope:$sc"
                         Add-Finding $findings "High" "Roles" "SP has active directory role: $rn" "Scope: $sc"
@@ -1343,7 +1364,7 @@ function Invoke-AccessCheck {
         Write-Host -ForegroundColor $col "  $sev ($($grp.Count)):"
         foreach ($f in $grp) {
             Write-Host -ForegroundColor $col "    $tag [$($f.Category)] $($f.Finding)"
-            if ($f.Detail) { Write-Host -ForegroundColor DarkGray "          $($f.Detail)" }
+            if ($f.Detail) { ($f.Detail -split "`n") | ForEach-Object { Write-Host -ForegroundColor DarkGray "          $_" } }
         }
     }
 
