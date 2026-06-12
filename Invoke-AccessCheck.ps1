@@ -1054,9 +1054,9 @@ function Invoke-AccessCheck {
             Add-Finding $findings "Critical" "CAP" "MFA is required by CAP but user has no registered MFA methods" "Authentication will likely fail or fall back unexpectedly"
         } elseif ($hasMfaEnforcement -and -not $mfaEnumerationSucceeded) {
             Add-Finding $findings "Info" "CAP" "MFA is required by CAP but authentication methods could not be enumerated (403 Forbidden)" ("Manually verify MFA registration for this user; UserAuthenticationMethod.Read.All is required`n" +
-                    "Entra admin center → Users → All users → [user] → Authentication methods`n" +
-                    "Entra admin center → Protection → Authentication methods → Settings → System-preferred multifactor authentication`n" +
-                    "Entra admin center → Users → All users → Per-user MFA (legacy per-user state)")
+                    "Entra admin center -> Users -> All users -> [user] -> Authentication methods`n" +
+                    "Entra admin center -> Protection -> Authentication methods -> Settings -> System-preferred multifactor authentication`n" +
+                    "Entra admin center -> Users -> All users -> Per-user MFA (legacy per-user state)")
         }
 
         # Check for legacy auth coverage
