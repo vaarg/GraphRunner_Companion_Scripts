@@ -1019,7 +1019,7 @@ function Invoke-AccessCheck {
         if ($notApplicablePolicies.Count -gt 0) {
             Write-Host ""
             Write-Host -ForegroundColor Yellow "  Policies NOT applying to target:"
-            foreach ($p in ($notApplicablePolicies | Sort-Object @{e='Excluded';desc=$true}, @{e='Disabled';desc=$false})) {
+            foreach ($p in ($notApplicablePolicies | Sort-Object @{e={ if ($_.Disabled) { 2 } elseif ($_.ReportOnly) { 1 } else { 0 } }}, @{e='Excluded';desc=$true})) {
                 $flag = if ($p.Excluded) { "  [EXCLUDED]" } else { "" }
                 $col  = if ($p.Excluded) { "Red" } elseif ($p.Disabled -or $p.ReportOnly) { "DarkGray" } else { "Yellow" }
                 Write-Host -ForegroundColor $col "    [-] $($p.DisplayName) -- $($p.Reason)$flag"
