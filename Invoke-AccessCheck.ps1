@@ -364,6 +364,18 @@ function Invoke-AccessCheck {
         New-Item -Path $OutputPath -ItemType Directory | Out-Null
     }
 
+    $usingTranscript = $false
+    if ($OutputPath) {
+        $transcriptPath = Join-Path $OutputPath "AccessCheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+        try {
+            Start-Transcript -Path $transcriptPath -Force | Out-Null
+            $usingTranscript = $true
+            Write-Host -ForegroundColor Yellow "[*] Transcript: $transcriptPath"
+        } catch {
+            Write-Host -ForegroundColor Yellow "[*] Could not start transcript: $_"
+        }
+    }
+
     # -----------------------------------------------------------------------
     # 1. Token claims decode
     # -----------------------------------------------------------------------
@@ -373,6 +385,7 @@ function Invoke-AccessCheck {
     $claims = Get-JwtClaims -Token $TS.AccessToken
     if ($null -eq $claims) {
         Write-Host -ForegroundColor Red "[!] Failed to decode access token JWT."
+        if ($usingTranscript) { Stop-Transcript | Out-Null }
         return
     }
 
@@ -540,6 +553,7 @@ function Invoke-AccessCheck {
 
     if ([string]::IsNullOrWhiteSpace($targetId)) {
         Write-Host -ForegroundColor Red "[!] Could not resolve target object ID. Cannot continue."
+        if ($usingTranscript) { Stop-Transcript | Out-Null }
         return
     }
 
@@ -953,6 +967,7 @@ function Invoke-AccessCheck {
                     Reason      = $reason
                     Excluded    = $excluded
                     Disabled    = $false
+                    ReportOnly  = $false
                 })
             }
         }
@@ -964,6 +979,7 @@ function Invoke-AccessCheck {
                 Reason      = "Report-only (not enforced)"
                 Excluded    = $false
                 Disabled    = $false
+                ReportOnly  = $true
             })
         }
         foreach ($pol in $disabledPolicies) {
@@ -972,6 +988,7 @@ function Invoke-AccessCheck {
                 Reason      = "Policy is disabled"
                 Excluded    = $false
                 Disabled    = $true
+                ReportOnly  = $false
             })
         }
 
@@ -1004,7 +1021,7 @@ function Invoke-AccessCheck {
             Write-Host -ForegroundColor Yellow "  Policies NOT applying to target:"
             foreach ($p in ($notApplicablePolicies | Sort-Object @{e='Excluded';desc=$true}, @{e='Disabled';desc=$false})) {
                 $flag = if ($p.Excluded) { "  [EXCLUDED]" } else { "" }
-                $col  = if ($p.Excluded) { "Red" } elseif ($p.Disabled) { "DarkGray" } else { "Yellow" }
+                $col  = if ($p.Excluded) { "Red" } elseif ($p.Disabled -or $p.ReportOnly) { "DarkGray" } else { "Yellow" }
                 Write-Host -ForegroundColor $col "    [-] $($p.DisplayName) -- $($p.Reason)$flag"
                 if ($p.Excluded) {
                     Add-Finding $findings "High" "CAP" "Target is EXCLUDED from policy: $($p.DisplayName)" "Explicit exclusion bypasses this policy's controls"
@@ -1345,4 +1362,6 @@ function Invoke-AccessCheck {
     Write-Host -ForegroundColor Cyan "  Invoke-AccessCheck complete."
     Write-Host -ForegroundColor Cyan ("=" * 70)
     Write-Host ""
+
+    if ($usingTranscript) { Stop-Transcript | Out-Null }
 }
