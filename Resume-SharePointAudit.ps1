@@ -1010,7 +1010,7 @@ function Invoke-DriveSearchSharePointByList {
     )
 
     $filenamePatterns = @(
-        [regex]::Matches($SearchTerm, '(?i)filename:"([^"]+)"|(?i)filename:(\S+)') |
+        [regex]::Matches($SearchTerm, '(?i)filename:"([^"]+)"|(?i)filename:([^\s\)"''(,]+)') |
             ForEach-Object {
                 if ($_.Groups[1].Success -and $_.Groups[1].Value) { $_.Groups[1].Value }
                 else { $_.Groups[2].Value }
@@ -1021,7 +1021,7 @@ function Invoke-DriveSearchSharePointByList {
     $cleanedQuery = $SearchTerm
     $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filetype:[.\w-]+', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:"[^"]+"', '')
-    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:\S+', '')
+    $cleanedQuery = [regex]::Replace($cleanedQuery, '(?i)filename:[^\s\)"''(,]+', '')
     $cleanedQuery = [regex]::Replace($cleanedQuery, '\bNEAR\(n=\d+\)\s*', ' ')
     # Strip KQL trailing wildcards -- the drive search endpoint returns 400 on wildcard terms
     $cleanedQuery = $cleanedQuery -replace '(\w)\*', '$1'
@@ -1163,8 +1163,11 @@ function Invoke-DriveSearchSharePointByList {
                         $itemExt = [System.IO.Path]::GetExtension($item.name).TrimStart('.')
                         foreach ($ext in $extensions) {
                             if ($ext -match '^\..') {
-                                # Extension starts with a dot (e.g. .git-credentials) — match full filename
+                                # Dot-prefixed (e.g. .git-credentials) — match full filename
                                 if ($item.name -ieq $ext) { $matchesFilter = $true; break }
+                            } elseif ($ext -match '\.') {
+                                # Compound extension (e.g. tfstate.backup) — suffix match
+                                if ($item.name -ilike "*.$ext") { $matchesFilter = $true; break }
                             } elseif ($itemExt -ieq $ext) {
                                 $matchesFilter = $true; break
                             }
