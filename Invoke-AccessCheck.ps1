@@ -588,7 +588,14 @@ function Invoke-AccessCheck {
             $userRoleIds += $r.id
         }
     } catch {
-        Write-Host -ForegroundColor Red "[!] Transitive memberships: $_"
+        $msg = $_.Exception.Message
+        if ($msg -match 'HTTP 404') {
+            Write-Host -ForegroundColor Yellow "  [*] Transitive memberships: 404 Not Found"
+            Write-Host -ForegroundColor Yellow "      URL: $nextLink"
+            Write-Host -ForegroundColor Yellow "      Verify the target object ID is correct and that the token has User.Read.All, GroupMember.Read.All, or Directory.Read.All; group/role data will be absent from CAP analysis"
+        } else {
+            Write-Host -ForegroundColor Red "[!] Transitive memberships ($nextLink): $msg"
+        }
     }
 
     # Active directory role assignments
@@ -655,13 +662,15 @@ function Invoke-AccessCheck {
         $authBase = "https://graph.microsoft.com/v1.0/$meOrUser/authentication"
         $betaBase = "https://graph.microsoft.com/beta/$meOrUser/authentication"
 
-        $hasAuthenticator = $false; $hasFido2  = $false; $hasPhone      = $false
-        $hasTap           = $false; $hasWindowsHello = $false; $hasEmail = $false
+        $hasAuthenticator        = $false; $hasFido2  = $false; $hasPhone      = $false
+        $hasTap                  = $false; $hasWindowsHello = $false; $hasEmail = $false
+        $mfaEnumerationSucceeded = $false
 
         # All registered methods
         try {
-            $methodsResp       = Invoke-GRequest -Uri "$authBase/methods" -TS $TS
-            $registeredMethods = @($methodsResp.value)
+            $methodsResp             = Invoke-GRequest -Uri "$authBase/methods" -TS $TS
+            $registeredMethods       = @($methodsResp.value)
+            $mfaEnumerationSucceeded = $true
 
             if ($registeredMethods.Count -eq 0) {
                 Write-Host -ForegroundColor Red "  [!] No MFA methods registered"
@@ -943,12 +952,31 @@ function Invoke-AccessCheck {
                     DisplayName = $pol.displayName
                     Reason      = $reason
                     Excluded    = $excluded
+                    Disabled    = $false
                 })
             }
         }
 
+        # Include report-only and disabled policies in the not-applying list
+        foreach ($pol in $reportOnlyPolicies) {
+            $notApplicablePolicies.Add([pscustomobject]@{
+                DisplayName = $pol.displayName
+                Reason      = "Report-only (not enforced)"
+                Excluded    = $false
+                Disabled    = $false
+            })
+        }
+        foreach ($pol in $disabledPolicies) {
+            $notApplicablePolicies.Add([pscustomobject]@{
+                DisplayName = $pol.displayName
+                Reason      = "Policy is disabled"
+                Excluded    = $false
+                Disabled    = $true
+            })
+        }
+
         Write-Host -ForegroundColor Green "  Enabled policies applicable to target : $($applicablePolicies.Count)"
-        Write-Host -ForegroundColor Yellow "  Enabled policies NOT applicable       : $($notApplicablePolicies.Count)"
+        Write-Host -ForegroundColor Yellow "  Policies NOT applying to target       : $($notApplicablePolicies.Count)"
 
         if ($applicablePolicies.Count -gt 0) {
             Write-Host ""
@@ -974,9 +1002,9 @@ function Invoke-AccessCheck {
         if ($notApplicablePolicies.Count -gt 0) {
             Write-Host ""
             Write-Host -ForegroundColor Yellow "  Policies NOT applying to target:"
-            foreach ($p in ($notApplicablePolicies | Sort-Object Excluded -Descending)) {
+            foreach ($p in ($notApplicablePolicies | Sort-Object @{e='Excluded';desc=$true}, @{e='Disabled';desc=$false})) {
                 $flag = if ($p.Excluded) { "  [EXCLUDED]" } else { "" }
-                $col  = if ($p.Excluded) { "Red" } else { "Yellow" }
+                $col  = if ($p.Excluded) { "Red" } elseif ($p.Disabled) { "DarkGray" } else { "Yellow" }
                 Write-Host -ForegroundColor $col "    [-] $($p.DisplayName) -- $($p.Reason)$flag"
                 if ($p.Excluded) {
                     Add-Finding $findings "High" "CAP" "Target is EXCLUDED from policy: $($p.DisplayName)" "Explicit exclusion bypasses this policy's controls"
@@ -991,8 +1019,10 @@ function Invoke-AccessCheck {
         if (-not $hasMfaEnforcement -and $enabledPolicies.Count -gt 0) {
             Add-Finding $findings "High" "CAP" "No applicable enabled CAP enforces MFA for this user" "Sign-in without MFA may be possible depending on app and legacy per-user MFA state"
         }
-        if ($hasMfaEnforcement -and $registeredMethods.Count -eq 0) {
+        if ($hasMfaEnforcement -and $mfaEnumerationSucceeded -and $registeredMethods.Count -eq 0) {
             Add-Finding $findings "Critical" "CAP" "MFA is required by CAP but user has no registered MFA methods" "Authentication will likely fail or fall back unexpectedly"
+        } elseif ($hasMfaEnforcement -and -not $mfaEnumerationSucceeded) {
+            Add-Finding $findings "Info" "CAP" "MFA is required by CAP but authentication methods could not be enumerated (403 Forbidden)" "Manually verify MFA registration for this user; UserAuthenticationMethod.Read.All is required"
         }
 
         # Check for legacy auth coverage
@@ -1057,7 +1087,8 @@ function Invoke-AccessCheck {
 
         # App roles assigned to the user in enterprise apps
         try {
-            $arResp = Invoke-GRequest -Uri "https://graph.microsoft.com/v1.0/$meOrUser/appRoleAssignments" -TS $TS
+            $arUri  = "https://graph.microsoft.com/v1.0/$meOrUser/appRoleAssignments"
+            $arResp = Invoke-GRequest -Uri $arUri -TS $TS
             $arList = @($arResp.value)
             if ($arList.Count -gt 0) {
                 Write-Host -ForegroundColor Green "  App role assignments ($($arList.Count)):"
@@ -1068,7 +1099,14 @@ function Invoke-AccessCheck {
                 Write-Host -ForegroundColor Yellow "  No app role assignments found"
             }
         } catch {
-            Write-Host -ForegroundColor Yellow "  [*] App role assignments: $($_.Exception.Message -replace 'HTTP \d+ - ','')"
+            $msg = $_.Exception.Message
+            if ($msg -match 'HTTP 404') {
+                Write-Host -ForegroundColor Yellow "  [*] App role assignments: 404 Not Found"
+                Write-Host -ForegroundColor Yellow "      URL: $arUri"
+                Write-Host -ForegroundColor Yellow "      Verify the target object ID is correct and that the token has AppRoleAssignment.ReadWrite.All or Directory.Read.All"
+            } else {
+                Write-Host -ForegroundColor Yellow "  [*] App role assignments ($arUri): $($msg -replace 'HTTP \d+ - ','')"
+            }
         }
 
         # OAuth2 delegated permission grants (clients that can act as this user)
